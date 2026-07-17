@@ -9,10 +9,12 @@
 mod dkdv;
 mod dq;
 mod prepass;
+mod tiled;
 
 pub use dkdv::flash_attention_backward_dkdv;
 pub use dq::flash_attention_backward_dq;
 pub use prepass::flash_attention_backward_prepass;
+pub use tiled::flash_attention_backward_tiled;
 
 use cubecl::{Runtime, client::ComputeClient, prelude::*, std::tensor::TensorHandle};
 

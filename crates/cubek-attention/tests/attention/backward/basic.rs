@@ -622,3 +622,147 @@ fn sweep_b1_h4_n128_d128() {
 fn sweep_b1_h1_n257_d32() {
     run_end_to_end(sweep_problem(1, 1, 257, 32));
 }
+
+// ===========================================================================
+// Tensor-core tiled backward
+// ===========================================================================
+
+/// bf16 cmma operands round each S/dP/P/dS element to 8 mantissa bits, so
+/// the tolerance is materially wider than the fp32 scaffold's — this bound
+/// matches the precision profile of the bf16 GEMM chain the tiled kernels
+/// replace.
+const TILED_EPS: f32 = 3e-2;
+
+fn run_tiled_end_to_end(problem: AttentionProblem) {
+    use cubek_attention::backward::flash_attention_backward_tiled;
+
+    let client = <TestRuntime as Runtime>::client(&Default::default());
+    let inputs = seed_inputs(&client, &problem);
+
+    let dbg = flash_attention_backward_reference_debug(
+        &inputs.q_data,
+        &inputs.k_data,
+        &inputs.v_data,
+        &inputs.do_data,
+        &problem,
+    );
+
+    let row_shape = [
+        problem.dims.batch,
+        problem.dims.num_heads,
+        problem.dims.seq_q,
+    ];
+    let q_shape = [
+        problem.dims.batch,
+        problem.dims.num_heads,
+        problem.dims.seq_q,
+        problem.dims.head_dim,
+    ];
+    let k_shape = [
+        problem.dims.batch,
+        problem.dims.num_heads,
+        problem.dims.seq_kv,
+        problem.dims.head_dim,
+    ];
+    let v_shape = [
+        problem.dims.batch,
+        problem.dims.num_heads,
+        problem.dims.seq_kv,
+        problem.dims.val_dim,
+    ];
+    let o_shape = [
+        problem.dims.batch,
+        problem.dims.num_heads,
+        problem.dims.seq_q,
+        problem.dims.val_dim,
+    ];
+
+    let o = TestInput::builder(client.clone(), Shape::new(o_shape))
+        .dtype(problem.global_dtypes.out)
+        .custom(o_data_to_vec(&dbg))
+        .generate_without_host_data();
+    let lse = upload_row(&client, row_shape, &dbg.lse);
+    let d = zeros_row(
+        &client,
+        row_shape,
+        f32::as_type_native_unchecked().storage_type(),
+    );
+    let dq = zeros_like(&client, q_shape, problem.global_dtypes.query);
+    let dk = zeros_like(&client, k_shape, problem.global_dtypes.key);
+    let dv = zeros_like(&client, v_shape, problem.global_dtypes.value);
+    let dq_handle = dq.clone();
+    let dk_handle = dk.clone();
+    let dv_handle = dv.clone();
+
+    let cfg = config(&problem);
+    let outcome = launch_and_capture_outcome(&client, |c| {
+        flash_attention_backward_tiled::<f32, f32, TestRuntime>(
+            c,
+            inputs.q.clone().binding(),
+            inputs.k.clone().binding(),
+            inputs.v.clone().binding(),
+            o.clone().binding(),
+            inputs.do_.clone().binding(),
+            lse.clone().binding(),
+            d.clone().binding(),
+            dq.clone().binding(),
+            dk.clone().binding(),
+            dv.clone().binding(),
+            cfg.scale,
+            cfg.causal,
+        )
+        .into()
+    });
+
+    match outcome {
+        ExecutionOutcome::CompileError(e) => TestOutcome::CompileError(e).enforce(),
+        ExecutionOutcome::Executed => {
+            let actual_dq = HostData::from_tensor_handle(&client, dq_handle, HostDataType::F32);
+            let actual_dk = HostData::from_tensor_handle(&client, dk_handle, HostDataType::F32);
+            let actual_dv = HostData::from_tensor_handle(&client, dv_handle, HostDataType::F32);
+            let result = flash_attention_backward_reference(
+                &inputs.q_data,
+                &inputs.k_data,
+                &inputs.v_data,
+                &inputs.do_data,
+                &dbg.lse,
+                &dbg.d,
+                &problem,
+            );
+            assert_equals_approx(&actual_dq, &result.dq, TILED_EPS)
+                .as_test_outcome()
+                .enforce();
+            assert_equals_approx(&actual_dk, &result.dk, TILED_EPS)
+                .as_test_outcome()
+                .enforce();
+            assert_equals_approx(&actual_dv, &result.dv, TILED_EPS)
+                .as_test_outcome()
+                .enforce();
+        }
+    }
+}
+
+#[test]
+fn tiled_end_to_end_n64() {
+    run_tiled_end_to_end(problem(64, 64, 64, 64));
+}
+
+#[test]
+fn tiled_end_to_end_causal_n64() {
+    run_tiled_end_to_end(problem_causal(64, 64, 64, 64));
+}
+
+#[test]
+fn tiled_end_to_end_n128_multihead() {
+    let mut p = problem(128, 128, 64, 64);
+    p.dims.batch = 2;
+    p.dims.num_heads = 4;
+    run_tiled_end_to_end(p);
+}
+
+#[test]
+fn tiled_end_to_end_causal_n256() {
+    let mut p = problem_causal(256, 256, 64, 64);
+    p.dims.num_heads = 2;
+    run_tiled_end_to_end(p);
+}

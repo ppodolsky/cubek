@@ -18,6 +18,7 @@ pub mod routines;
 
 pub use definition::{BackwardConfig, TileShape};
 pub use launch::{
+    flash_attention_backward_tiled,
     flash_attention_backward, flash_attention_backward_dkdv, flash_attention_backward_dq,
     flash_attention_backward_prepass,
 };
